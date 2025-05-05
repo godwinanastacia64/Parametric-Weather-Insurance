@@ -259,3 +259,82 @@
             (>= (get humidity data) threshold)
             false)))))
 )
+
+
+
+
+(define-constant err-transfer-failed (err u109))
+
+(define-public (transfer-policy (policy-id uint) (recipient principal))
+    (let 
+        ((policy (unwrap! (map-get? policies { policy-id: policy-id }) err-policy-not-found)))
+        (asserts! (is-eq tx-sender (get owner policy)) err-not-authorized)
+        (asserts! (get active policy) err-policy-not-found)
+        (asserts! (not (get claimed policy)) err-already-claimed)
+        
+        (map-set policies
+            { policy-id: policy-id }
+            (merge policy { owner: recipient })
+        )
+        (ok true)
+    )
+)
+
+
+(define-map multi-location-policies
+    { policy-id: uint }
+    {
+        owner: principal,
+        premium: uint,
+        coverage: uint,
+        start-block: uint,
+        end-block: uint,
+        locations: (list 5 (string-ascii 64)),
+        weather-condition: (string-ascii 32),
+        threshold: uint,
+        claimed: bool,
+        active: bool
+    }
+)
+
+(define-public (create-multi-location-policy 
+    (premium uint) 
+    (coverage uint) 
+    (duration uint) 
+    (locations (list 5 (string-ascii 64))) 
+    (weather-condition (string-ascii 32)) 
+    (threshold uint))
+    (let 
+        (
+            (policy-id (+ (var-get total-policies-created) u1))
+            (start-block stacks-block-height)
+            (end-block (+ stacks-block-height duration))
+            (protocol-fee (/ (* premium (var-get protocol-fee-percent)) u100))
+        )
+        (asserts! (>= coverage premium) err-invalid-parameters)
+        (asserts! (and (>= duration (var-get min-policy-duration)) (<= duration (var-get max-policy-duration))) err-invalid-parameters)
+        (asserts! (is-valid-weather-condition weather-condition) err-invalid-parameters)
+        
+        (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
+        (try! (stx-transfer? protocol-fee (as-contract tx-sender) contract-owner))
+        (var-set total-stx-locked (+ (var-get total-stx-locked) (- premium protocol-fee)))
+        (var-set total-policies-created policy-id)
+        
+        (map-set multi-location-policies
+            { policy-id: policy-id }
+            {
+                owner: tx-sender,
+                premium: premium,
+                coverage: coverage,
+                start-block: start-block,
+                end-block: end-block,
+                locations: locations,
+                weather-condition: weather-condition,
+                threshold: threshold,
+                claimed: false,
+                active: true
+            }
+        )
+        (ok policy-id)
+    )
+)
