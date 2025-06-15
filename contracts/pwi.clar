@@ -338,3 +338,69 @@
         (ok policy-id)
     )
 )
+
+
+(define-constant err-payout-reward-too-high (err u110))
+(define-constant err-policy-not-eligible (err u111))
+
+(define-data-var automated-payout-reward uint u1000000)
+
+(define-public (set-automated-payout-reward (reward uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= reward u10000000) err-payout-reward-too-high)
+    (var-set automated-payout-reward reward)
+    (ok true)
+  )
+)
+
+(define-public (trigger-automated-payout (policy-id uint))
+  (let 
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-policy-not-found))
+      (latest-data (get-latest-weather-data (get location-id policy)))
+      (reward (var-get automated-payout-reward))
+    )
+    (asserts! (get active policy) err-policy-not-found)
+    (asserts! (not (get claimed policy)) err-already-claimed)
+    (asserts! (<= stacks-block-height (get end-block policy)) err-policy-expired)
+    (asserts! (is-claim-valid policy latest-data) err-policy-not-eligible)
+    
+    (map-set policies
+      { policy-id: policy-id }
+      (merge policy { claimed: true })
+    )
+    
+    (var-set total-stx-locked (- (var-get total-stx-locked) (get premium policy)))
+    (var-set total-policies-claimed (+ (var-get total-policies-claimed) u1))
+    
+    (try! (as-contract (stx-transfer? (get coverage policy) contract-caller (get owner policy))))
+    (try! (as-contract (stx-transfer? reward contract-caller tx-sender)))
+    (ok true)
+  )
+)
+
+(define-read-only (is-policy-eligible-for-payout (policy-id uint))
+  (match (map-get? policies { policy-id: policy-id })
+    policy 
+    (let 
+      (
+        (latest-data (get-latest-weather-data (get location-id policy)))
+      )
+      (and 
+        (get active policy)
+        (not (get claimed policy))
+        (<= stacks-block-height (get end-block policy))
+        (is-claim-valid policy latest-data)
+      )
+    )
+    false
+  )
+)
+
+(define-read-only (get-automated-payout-info)
+  {
+    reward-amount: (var-get automated-payout-reward),
+    contract-balance: (stx-get-balance (as-contract tx-sender))
+  }
+)
