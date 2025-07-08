@@ -404,3 +404,366 @@
     contract-balance: (stx-get-balance (as-contract tx-sender))
   }
 )
+
+(define-constant err-data-point-exists (err u112))
+(define-constant err-invalid-timeframe (err u113))
+(define-constant err-invalid-location (err u114))
+(define-constant err-insufficient-data (err u115))
+(define-constant err-invalid-metric (err u116))
+
+(define-data-var max-historical-entries uint u1000)
+(define-data-var data-access-fee uint u100000)
+(define-data-var total-weather-entries uint u0)
+
+(define-map weather-history
+  { location-id: (string-ascii 64), timestamp: uint }
+  {
+    temperature: int,
+    rainfall: uint,
+    wind-speed: uint,
+    humidity: uint,
+    recorded-by: principal,
+    verified: bool
+  }
+)
+
+(define-map location-stats
+  { location-id: (string-ascii 64) }
+  {
+    total-entries: uint,
+    avg-temperature: int,
+    avg-rainfall: uint,
+    avg-wind-speed: uint,
+    avg-humidity: uint,
+    max-temperature: int,
+    min-temperature: int,
+    max-rainfall: uint,
+    max-wind-speed: uint,
+    max-humidity: uint,
+    last-updated: uint
+  }
+)
+
+(define-map risk-analysis
+  { location-id: (string-ascii 64), metric: (string-ascii 32) }
+  {
+    risk-score: uint,
+    volatility-index: uint,
+    trend-direction: (string-ascii 10),
+    confidence-level: uint,
+    last-calculated: uint
+  }
+)
+
+(define-map user-analytics-access
+  { user: principal }
+  {
+    access-level: (string-ascii 20),
+    queries-used: uint,
+    last-query: uint,
+    subscription-expires: uint
+  }
+)
+
+(define-public (set-data-access-fee (fee uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= fee u1000000) err-invalid-parameters)
+    (var-set data-access-fee fee)
+    (ok true)
+  )
+)
+
+(define-public (set-max-historical-entries (max-entries uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (>= max-entries u100) err-invalid-parameters)
+    (var-set max-historical-entries max-entries)
+    (ok true)
+  )
+)
+
+(define-public (submit-historical-weather-data
+  (location-id (string-ascii 64))
+  (timestamp uint)
+  (temperature int)
+  (rainfall uint)
+  (wind-speed uint)
+  (humidity uint))
+  (let
+    (
+      (current-entries (var-get total-weather-entries))
+      (max-entries (var-get max-historical-entries))
+    )
+    (asserts! (is-eq tx-sender (var-get oracle-address)) err-oracle-only)
+    (asserts! (< timestamp stacks-block-height) err-invalid-timeframe)
+    (asserts! (< current-entries max-entries) err-insufficient-funds)
+    (asserts! (is-none (map-get? weather-history { location-id: location-id, timestamp: timestamp })) err-data-point-exists)
+    
+    (map-set weather-history
+      { location-id: location-id, timestamp: timestamp }
+      {
+        temperature: temperature,
+        rainfall: rainfall,
+        wind-speed: wind-speed,
+        humidity: humidity,
+        recorded-by: tx-sender,
+        verified: true
+      }
+    )
+    
+    (var-set total-weather-entries (+ current-entries u1))
+    (unwrap! (update-location-statistics location-id temperature rainfall wind-speed humidity) err-invalid-parameters)
+    (ok true)
+  )
+)
+
+(define-public (purchase-analytics-access (access-level (string-ascii 20)) (duration uint))
+  (let
+    (
+      (access-fee (var-get data-access-fee))
+      (total-fee (if (is-eq access-level "premium") (* access-fee u3) access-fee))
+      (expiry-block (+ stacks-block-height duration))
+    )
+    (asserts! (or (is-eq access-level "basic") (is-eq access-level "premium")) err-invalid-parameters)
+    (asserts! (and (>= duration u1440) (<= duration u525600)) err-invalid-timeframe)
+    
+    (try! (stx-transfer? total-fee tx-sender (as-contract tx-sender)))
+    
+    (map-set user-analytics-access
+      { user: tx-sender }
+      {
+        access-level: access-level,
+        queries-used: u0,
+        last-query: u0,
+        subscription-expires: expiry-block
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (calculate-risk-score (location-id (string-ascii 64)) (metric (string-ascii 32)))
+  (let
+    (
+      (user-access (map-get? user-analytics-access { user: tx-sender }))
+      (location-stats-data (map-get? location-stats { location-id: location-id }))
+    )
+    (asserts! (is-some user-access) err-not-authorized)
+    (asserts! (> (get subscription-expires (unwrap! user-access err-not-authorized)) stacks-block-height) err-not-authorized)
+    (asserts! (is-some location-stats-data) err-invalid-location)
+    (asserts! (is-valid-weather-condition metric) err-invalid-metric)
+    
+    (let
+      (
+        (stats (unwrap! location-stats-data err-invalid-location))
+        (risk-score (calculate-risk-value metric stats))
+        (volatility (calculate-volatility-index metric stats))
+        (trend (determine-trend-direction metric stats))
+        (confidence (calculate-confidence-level stats))
+      )
+      (map-set risk-analysis
+        { location-id: location-id, metric: metric }
+        {
+          risk-score: risk-score,
+          volatility-index: volatility,
+          trend-direction: trend,
+          confidence-level: confidence,
+          last-calculated: stacks-block-height
+        }
+      )
+      
+      (map-set user-analytics-access
+        { user: tx-sender }
+        (merge (unwrap! user-access err-not-authorized) { queries-used: (+ (get queries-used (unwrap! user-access err-not-authorized)) u1) })
+      )
+      
+      (ok { risk-score: risk-score, volatility-index: volatility, trend-direction: trend, confidence-level: confidence })
+    )
+  )
+)
+
+(define-private (update-location-statistics
+  (location-id (string-ascii 64))
+  (temperature int)
+  (rainfall uint)
+  (wind-speed uint)
+  (humidity uint))
+  (let
+    (
+      (existing-stats (map-get? location-stats { location-id: location-id }))
+    )
+    (match existing-stats
+      stats
+      (let
+        (
+          (total-entries (+ (get total-entries stats) u1))
+          (new-avg-temp (/ (+ (* (get avg-temperature stats) (to-int (get total-entries stats))) temperature) (to-int total-entries)))
+          (new-avg-rainfall (/ (+ (* (get avg-rainfall stats) (get total-entries stats)) rainfall) total-entries))
+          (new-avg-wind (/ (+ (* (get avg-wind-speed stats) (get total-entries stats)) wind-speed) total-entries))
+          (new-avg-humidity (/ (+ (* (get avg-humidity stats) (get total-entries stats)) humidity) total-entries))
+        )
+        (map-set location-stats
+          { location-id: location-id }
+          {
+            total-entries: total-entries,
+            avg-temperature: new-avg-temp,
+            avg-rainfall: new-avg-rainfall,
+            avg-wind-speed: new-avg-wind,
+            avg-humidity: new-avg-humidity,
+            max-temperature: (if (> temperature (get max-temperature stats)) temperature (get max-temperature stats)),
+            min-temperature: (if (< temperature (get min-temperature stats)) temperature (get min-temperature stats)),
+            max-rainfall: (if (> rainfall (get max-rainfall stats)) rainfall (get max-rainfall stats)),
+            max-wind-speed: (if (> wind-speed (get max-wind-speed stats)) wind-speed (get max-wind-speed stats)),
+            max-humidity: (if (> humidity (get max-humidity stats)) humidity (get max-humidity stats)),
+            last-updated: stacks-block-height
+          }
+        )
+      )
+      (map-set location-stats
+        { location-id: location-id }
+        {
+          total-entries: u1,
+          avg-temperature: temperature,
+          avg-rainfall: rainfall,
+          avg-wind-speed: wind-speed,
+          avg-humidity: humidity,
+          max-temperature: temperature,
+          min-temperature: temperature,
+          max-rainfall: rainfall,
+          max-wind-speed: wind-speed,
+          max-humidity: humidity,
+          last-updated: stacks-block-height
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-private (calculate-risk-value (metric (string-ascii 32)) (stats {
+  total-entries: uint,
+  avg-temperature: int,
+  avg-rainfall: uint,
+  avg-wind-speed: uint,
+  avg-humidity: uint,
+  max-temperature: int,
+  min-temperature: int,
+  max-rainfall: uint,
+  max-wind-speed: uint,
+  max-humidity: uint,
+  last-updated: uint
+}))
+  (if (is-eq metric "temperature")
+    (+ (/ (to-uint (- (get max-temperature stats) (get min-temperature stats))) u10) u10)
+    (if (is-eq metric "rainfall")
+      (+ (/ (get max-rainfall stats) u100) u5)
+      (if (is-eq metric "wind-speed")
+        (+ (/ (get max-wind-speed stats) u10) u5)
+        (if (is-eq metric "humidity")
+          (+ (/ (get max-humidity stats) u10) u5)
+          u50))))
+)
+
+(define-private (calculate-volatility-index (metric (string-ascii 32)) (stats {
+  total-entries: uint,
+  avg-temperature: int,
+  avg-rainfall: uint,
+  avg-wind-speed: uint,
+  avg-humidity: uint,
+  max-temperature: int,
+  min-temperature: int,
+  max-rainfall: uint,
+  max-wind-speed: uint,
+  max-humidity: uint,
+  last-updated: uint
+}))
+  (if (is-eq metric "temperature")
+    (/ (to-uint (- (get max-temperature stats) (get min-temperature stats))) u5)
+    (if (is-eq metric "rainfall")
+      (/ (get max-rainfall stats) u50)
+      (if (is-eq metric "wind-speed")
+        (/ (get max-wind-speed stats) u5)
+        (if (is-eq metric "humidity")
+          (/ (get max-humidity stats) u5)
+          u20))))
+)
+
+(define-private (determine-trend-direction (metric (string-ascii 32)) (stats {
+  total-entries: uint,
+  avg-temperature: int,
+  avg-rainfall: uint,
+  avg-wind-speed: uint,
+  avg-humidity: uint,
+  max-temperature: int,
+  min-temperature: int,
+  max-rainfall: uint,
+  max-wind-speed: uint,
+  max-humidity: uint,
+  last-updated: uint
+}))
+  (if (is-eq metric "temperature")
+    (if (> (get avg-temperature stats) (/ (+ (get max-temperature stats) (get min-temperature stats)) 2))
+      "increasing"
+      "decreasing")
+    (if (is-eq metric "rainfall")
+      (if (> (get avg-rainfall stats) (/ (get max-rainfall stats) u2))
+        "increasing"
+        "decreasing")
+      (if (is-eq metric "wind-speed")
+        (if (> (get avg-wind-speed stats) (/ (get max-wind-speed stats) u2))
+          "increasing"
+          "decreasing")
+        (if (is-eq metric "humidity")
+          (if (> (get avg-humidity stats) (/ (get max-humidity stats) u2))
+            "increasing"
+            "decreasing")
+          "stable"))))
+)
+
+(define-private (calculate-confidence-level (stats {
+  total-entries: uint,
+  avg-temperature: int,
+  avg-rainfall: uint,
+  avg-wind-speed: uint,
+  avg-humidity: uint,
+  max-temperature: int,
+  min-temperature: int,
+  max-rainfall: uint,
+  max-wind-speed: uint,
+  max-humidity: uint,
+  last-updated: uint
+}))
+  (if (>= (get total-entries stats) u100)
+    u95
+    (if (>= (get total-entries stats) u50)
+      u80
+      (if (>= (get total-entries stats) u20)
+        u65
+        u40)))
+)
+
+(define-read-only (get-weather-history (location-id (string-ascii 64)) (timestamp uint))
+  (map-get? weather-history { location-id: location-id, timestamp: timestamp })
+)
+
+(define-read-only (get-location-statistics (location-id (string-ascii 64)))
+  (map-get? location-stats { location-id: location-id })
+)
+
+(define-read-only (get-risk-analysis (location-id (string-ascii 64)) (metric (string-ascii 32)))
+  (map-get? risk-analysis { location-id: location-id, metric: metric })
+)
+
+(define-read-only (get-user-analytics-access (user principal))
+  (map-get? user-analytics-access { user: user })
+)
+
+(define-read-only (get-analytics-system-info)
+  {
+    max-historical-entries: (var-get max-historical-entries),
+    data-access-fee: (var-get data-access-fee),
+    total-weather-entries: (var-get total-weather-entries),
+    system-active: true
+  }
+)
