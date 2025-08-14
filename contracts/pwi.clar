@@ -767,3 +767,360 @@
     system-active: true
   }
 )
+
+;; Dynamic Coverage Adjustment System
+(define-constant err-adjustment-disabled (err u117))
+(define-constant err-invalid-scaling-factor (err u118))
+(define-constant err-coverage-limit-exceeded (err u119))
+(define-constant err-adjustment-too-frequent (err u120))
+(define-constant err-invalid-trigger-threshold (err u121))
+
+;; System configuration variables
+(define-data-var dynamic-adjustments-enabled bool true)
+(define-data-var max-coverage-multiplier uint u300) ;; 3x max coverage increase
+(define-data-var min-coverage-multiplier uint u50)  ;; 0.5x min coverage decrease
+(define-data-var adjustment-cooldown-period uint u144) ;; ~1 day cooldown
+(define-data-var total-adjustments-made uint u0)
+
+;; Coverage adjustment triggers and rules
+(define-map coverage-adjustment-rules
+  { location-id: (string-ascii 64), weather-condition: (string-ascii 32) }
+  {
+    base-threshold: uint,
+    scaling-factor: uint,
+    max-adjustment: uint,
+    min-adjustment: uint,
+    trigger-direction: (string-ascii 10), ;; "above" or "below"
+    active: bool,
+    created-at: uint
+  }
+)
+
+;; Track dynamic policy states
+(define-map dynamic-policy-state
+  { policy-id: uint }
+  {
+    original-coverage: uint,
+    current-coverage: uint,
+    current-premium: uint,
+    adjustment-count: uint,
+    last-adjustment: uint,
+    total-premium-paid: uint,
+    adjustment-history: (list 10 uint) ;; track last 10 coverage amounts
+  }
+)
+
+;; Coverage adjustment events log
+(define-map coverage-adjustments
+  { policy-id: uint, adjustment-id: uint }
+  {
+    old-coverage: uint,
+    new-coverage: uint,
+    old-premium: uint,
+    new-premium: uint,
+    trigger-condition: (string-ascii 32),
+    trigger-value: uint,
+    adjustment-timestamp: uint,
+    adjustment-reason: (string-ascii 64)
+  }
+)
+
+;; Enable or disable dynamic adjustments system-wide
+(define-public (toggle-dynamic-adjustments (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set dynamic-adjustments-enabled enabled)
+    (ok true)
+  )
+)
+
+;; Set coverage adjustment limits
+(define-public (set-coverage-limits (max-multiplier uint) (min-multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (and (>= max-multiplier u100) (<= max-multiplier u500)) err-invalid-scaling-factor)
+    (asserts! (and (>= min-multiplier u10) (<= min-multiplier u100)) err-invalid-scaling-factor)
+    (asserts! (> max-multiplier min-multiplier) err-invalid-parameters)
+    (var-set max-coverage-multiplier max-multiplier)
+    (var-set min-coverage-multiplier min-multiplier)
+    (ok true)
+  )
+)
+
+;; Create coverage adjustment rule for specific location and condition
+(define-public (create-adjustment-rule 
+  (location-id (string-ascii 64))
+  (weather-condition (string-ascii 32))
+  (base-threshold uint)
+  (scaling-factor uint)
+  (max-adjustment uint)
+  (min-adjustment uint)
+  (trigger-direction (string-ascii 10)))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-valid-weather-condition weather-condition) err-invalid-parameters)
+    (asserts! (or (is-eq trigger-direction "above") (is-eq trigger-direction "below")) err-invalid-parameters)
+    (asserts! (and (>= scaling-factor u50) (<= scaling-factor u300)) err-invalid-scaling-factor)
+    (asserts! (> max-adjustment min-adjustment) err-invalid-parameters)
+    
+    (map-set coverage-adjustment-rules
+      { location-id: location-id, weather-condition: weather-condition }
+      {
+        base-threshold: base-threshold,
+        scaling-factor: scaling-factor,
+        max-adjustment: max-adjustment,
+        min-adjustment: min-adjustment,
+        trigger-direction: trigger-direction,
+        active: true,
+        created-at: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Activate dynamic coverage for an existing policy
+(define-public (activate-dynamic-coverage (policy-id uint))
+  (let 
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-policy-not-found))
+    )
+    (asserts! (is-eq tx-sender (get owner policy)) err-not-authorized)
+    (asserts! (get active policy) err-policy-not-found)
+    (asserts! (var-get dynamic-adjustments-enabled) err-adjustment-disabled)
+    
+    ;; Initialize dynamic state tracking
+    (map-set dynamic-policy-state
+      { policy-id: policy-id }
+      {
+        original-coverage: (get coverage policy),
+        current-coverage: (get coverage policy),
+        current-premium: (get premium policy),
+        adjustment-count: u0,
+        last-adjustment: u0,
+        total-premium-paid: (get premium policy),
+        adjustment-history: (list (get coverage policy))
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Trigger coverage adjustment based on current weather conditions
+(define-public (trigger-coverage-adjustment (policy-id uint))
+  (let 
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-policy-not-found))
+      (dynamic-state (unwrap! (map-get? dynamic-policy-state { policy-id: policy-id }) err-policy-not-found))
+      (latest-weather (get-latest-weather-data (get location-id policy)))
+      (adjustment-rule (map-get? coverage-adjustment-rules 
+        { location-id: (get location-id policy), weather-condition: (get weather-condition policy) }))
+    )
+    (asserts! (get active policy) err-policy-not-found)
+    (asserts! (var-get dynamic-adjustments-enabled) err-adjustment-disabled)
+    (asserts! (is-some adjustment-rule) err-invalid-parameters)
+    (asserts! (is-some latest-weather) err-insufficient-data)
+    
+    ;; Check cooldown period
+    (asserts! (>= (- stacks-block-height (get last-adjustment dynamic-state)) (var-get adjustment-cooldown-period)) err-adjustment-too-frequent)
+    
+    (let 
+      (
+        (rule (unwrap! adjustment-rule err-invalid-parameters))
+        (weather-data (unwrap! latest-weather err-insufficient-data))
+        (current-value (get-weather-metric-value (get weather-condition policy) weather-data))
+        (should-adjust (check-adjustment-trigger rule current-value))
+      )
+      (if should-adjust
+        (match (execute-coverage-adjustment policy-id policy dynamic-state rule current-value)
+          success (ok true)
+          error (err error)
+        )
+        (ok false)
+      )
+    )
+  )
+)
+
+;; Execute the actual coverage adjustment
+(define-private (execute-coverage-adjustment 
+  (policy-id uint)
+  (policy {owner: principal, premium: uint, coverage: uint, start-block: uint, end-block: uint, location-id: (string-ascii 64), weather-condition: (string-ascii 32), threshold: uint, claimed: bool, active: bool})
+  (dynamic-state {original-coverage: uint, current-coverage: uint, current-premium: uint, adjustment-count: uint, last-adjustment: uint, total-premium-paid: uint, adjustment-history: (list 10 uint)})
+  (rule {base-threshold: uint, scaling-factor: uint, max-adjustment: uint, min-adjustment: uint, trigger-direction: (string-ascii 10), active: bool, created-at: uint})
+  (trigger-value uint))
+  (let 
+    (
+      (old-coverage (get current-coverage dynamic-state))
+      (old-premium (get current-premium dynamic-state))
+      (adjustment-factor (calculate-adjustment-factor rule trigger-value))
+      (new-coverage (calculate-new-coverage old-coverage adjustment-factor rule))
+      (new-premium (calculate-adjusted-premium old-premium old-coverage new-coverage))
+      (adjustment-id (+ (get adjustment-count dynamic-state) u1))
+    )
+    ;; Validate new coverage is within limits
+    (asserts! (and (>= new-coverage (get min-adjustment rule)) (<= new-coverage (get max-adjustment rule))) err-coverage-limit-exceeded)
+    
+    ;; Update policy coverage
+    (map-set policies
+      { policy-id: policy-id }
+      (merge policy { coverage: new-coverage, premium: new-premium })
+    )
+    
+    ;; Update dynamic state
+    (map-set dynamic-policy-state
+      { policy-id: policy-id }
+      (merge dynamic-state 
+        {
+          current-coverage: new-coverage,
+          current-premium: new-premium,
+          adjustment-count: adjustment-id,
+          last-adjustment: stacks-block-height,
+          total-premium-paid: (+ (get total-premium-paid dynamic-state) (if (> new-premium old-premium) (- new-premium old-premium) u0)),
+          adjustment-history: (unwrap! (as-max-len? (append (get adjustment-history dynamic-state) new-coverage) u10) err-invalid-parameters)
+        }
+      )
+    )
+    
+    ;; Log the adjustment
+    (map-set coverage-adjustments
+      { policy-id: policy-id, adjustment-id: adjustment-id }
+      {
+        old-coverage: old-coverage,
+        new-coverage: new-coverage,
+        old-premium: old-premium,
+        new-premium: new-premium,
+        trigger-condition: (get weather-condition policy),
+        trigger-value: trigger-value,
+        adjustment-timestamp: stacks-block-height,
+        adjustment-reason: "weather-based-adjustment"
+      }
+    )
+    
+    (var-set total-adjustments-made (+ (var-get total-adjustments-made) u1))
+    
+    ;; Handle premium difference
+    (if (> new-premium old-premium)
+      (try! (stx-transfer? (- new-premium old-premium) (get owner policy) (as-contract tx-sender)))
+      true
+    )
+    
+    (ok { old-coverage: old-coverage, new-coverage: new-coverage, adjustment-factor: adjustment-factor })
+  )
+)
+
+;; Helper function to get weather metric value from weather data
+(define-private (get-weather-metric-value (condition (string-ascii 32)) (weather-data {
+  temperature: int,
+  rainfall: uint,
+  wind-speed: uint,
+  humidity: uint,
+  updated-by: principal
+}))
+  (if (is-eq condition "temperature")
+    (to-uint (get temperature weather-data))
+    (if (is-eq condition "rainfall")
+      (get rainfall weather-data)
+      (if (is-eq condition "wind-speed")
+        (get wind-speed weather-data)
+        (if (is-eq condition "humidity")
+          (get humidity weather-data)
+          u0))))
+)
+
+;; Check if adjustment should be triggered
+(define-private (check-adjustment-trigger (rule {
+  base-threshold: uint,
+  scaling-factor: uint,
+  max-adjustment: uint,
+  min-adjustment: uint,
+  trigger-direction: (string-ascii 10),
+  active: bool,
+  created-at: uint
+}) (current-value uint))
+  (and 
+    (get active rule)
+    (if (is-eq (get trigger-direction rule) "above")
+      (> current-value (get base-threshold rule))
+      (< current-value (get base-threshold rule))
+    )
+  )
+)
+
+;; Calculate adjustment factor based on how far the value is from threshold
+(define-private (calculate-adjustment-factor (rule {
+  base-threshold: uint,
+  scaling-factor: uint,
+  max-adjustment: uint,
+  min-adjustment: uint,
+  trigger-direction: (string-ascii 10),
+  active: bool,
+  created-at: uint
+}) (trigger-value uint))
+  (let 
+    (
+      (threshold (get base-threshold rule))
+      (base-factor (get scaling-factor rule))
+      (variance (if (is-eq (get trigger-direction rule) "above")
+                  (if (> trigger-value threshold) (/ (* (- trigger-value threshold) u100) threshold) u100)
+                  (if (< trigger-value threshold) (/ (* (- threshold trigger-value) u100) threshold) u100)))
+    )
+    ;; Scale adjustment factor based on variance from threshold
+    (+ base-factor (/ (* variance u50) u100))
+  )
+)
+
+;; Calculate new coverage amount
+(define-private (calculate-new-coverage (current-coverage uint) (adjustment-factor uint) (rule {
+  base-threshold: uint,
+  scaling-factor: uint,
+  max-adjustment: uint,
+  min-adjustment: uint,
+  trigger-direction: (string-ascii 10),
+  active: bool,
+  created-at: uint
+}))
+  (let 
+    (
+      (adjusted-coverage (/ (* current-coverage adjustment-factor) u100))
+    )
+    ;; Ensure coverage stays within rule limits
+    (if (> adjusted-coverage (get max-adjustment rule))
+      (get max-adjustment rule)
+      (if (< adjusted-coverage (get min-adjustment rule))
+        (get min-adjustment rule)
+        adjusted-coverage))
+  )
+)
+
+;; Calculate adjusted premium proportional to coverage change
+(define-private (calculate-adjusted-premium (old-premium uint) (old-coverage uint) (new-coverage uint))
+  (/ (* old-premium new-coverage) old-coverage)
+)
+
+;; Read-only functions for dynamic coverage system
+(define-read-only (get-dynamic-policy-state (policy-id uint))
+  (map-get? dynamic-policy-state { policy-id: policy-id })
+)
+
+(define-read-only (get-coverage-adjustment-rule (location-id (string-ascii 64)) (weather-condition (string-ascii 32)))
+  (map-get? coverage-adjustment-rules { location-id: location-id, weather-condition: weather-condition })
+)
+
+(define-read-only (get-coverage-adjustment (policy-id uint) (adjustment-id uint))
+  (map-get? coverage-adjustments { policy-id: policy-id, adjustment-id: adjustment-id })
+)
+
+(define-read-only (get-dynamic-system-info)
+  {
+    enabled: (var-get dynamic-adjustments-enabled),
+    max-multiplier: (var-get max-coverage-multiplier),
+    min-multiplier: (var-get min-coverage-multiplier),
+    cooldown-period: (var-get adjustment-cooldown-period),
+    total-adjustments: (var-get total-adjustments-made)
+  }
+)
+
+
+
+
